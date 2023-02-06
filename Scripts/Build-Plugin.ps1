@@ -97,16 +97,18 @@ $pluginsPath = switch ($Project -eq "") {
     $False { Join-Path -Path (Get-ChildItem -Path $Project -File).DirectoryName -ChildPath "Plugins" }
 }
 
+$destinationPath = Join-Path (Split-Path -Path $EnginePath -Parent) -ChildPath $buildPath
 switch ($CopyToTarget) {
     'Yes' {
         if (Test-Path $pluginsPath -PathType Container) {
             throw "Destination plugin folder already exisits. Use `-CopyToTarget Force` if you intend to overwrite it."
         }
 
-        Move-Item -Path $buildPath -Destination $pluginsPath
+		echo $destination
+        Move-Item -Path $destinationPath -Destination $pluginsPath
     }
     'Force' {
-        Move-Item -Path $buildPath -Destination $pluginsPath -Force
+        Move-Item -Path $destinationPath -Destination $pluginsPath -Force
     }
     'No' {
         # noop

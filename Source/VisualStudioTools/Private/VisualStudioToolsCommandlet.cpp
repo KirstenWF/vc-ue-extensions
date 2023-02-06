@@ -70,6 +70,10 @@ static TArray<FProperty*> GetChangedPropertiesList(
 static bool FindBlueprintNativeParents(
 	const UClass* BlueprintGeneratedClass, TFunctionRef<void(UClass*)> Callback)
 {
+	if (BlueprintGeneratedClass == nullptr)
+	{
+		return false;
+	}
 	bool anyNativeParent = false;
 	for (UClass* Super = BlueprintGeneratedClass->GetSuperClass(); Super; Super = Super->GetSuperClass())
 	{
@@ -143,6 +147,11 @@ struct AssetIndex
 			propEntry.Blueprints.Add(BlueprintIndex);
 		}
 			});
+
+		if (BPGC == nullptr)
+		{
+			return;
+		}
 
 		bool hasAnyFunctions = false;
 		for (UFunction* Fn : BPGC->CalledFunctions)

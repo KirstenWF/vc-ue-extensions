@@ -5,13 +5,9 @@
 #include "Algo/Transform.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Blueprint/BlueprintSupport.h"
-#include "Engine/BlueprintCore.h"
+#include "BlueprintAssetHelpers.h"
 #include "Engine/BlueprintGeneratedClass.h"
-#include "Engine/Engine.h"
-#include "Engine/StreamableManager.h"
-#include "HAL/FileManager.h"
 #include "JsonObjectConverter.h"
-#include "Runtime/Launch/Resources/Version.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
@@ -19,26 +15,10 @@
 #include "UObject/UObjectIterator.h"
 #include "VisualStudioTools.h"
 
-namespace VSTools
+namespace VisualStudioTools
 {
-static const FName NAME_Category = TEXT("Category");
+static const FName CategoryFName = TEXT("Category");
 static const FName ModuleNameFName = TEXT("ModuleName");
-
-// Wrapper for conditional compilation of deprecated API usage
-// Might be overridden by the `Build.cs` rules.
-static void SetBlueprintClassFilter(FARFilter& InOutFilter)
-{
-	// UE5.1 deprecated the API to filter using class names
-#if !defined(FILTER_ASSETS_BY_CLASS_PATH)
-#define FILTER_ASSETS_BY_CLASS_PATH ((ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1) || ENGINE_MAJOR_VERSION > 5)
-#endif
-
-#if FILTER_ASSETS_BY_CLASS_PATH
-	InOutFilter.ClassPaths.Add(UBlueprintCore::StaticClass()->GetClassPathName());
-#else
-	InOutFilter.ClassNames.Add(UBlueprintCore::StaticClass()->GetFName());
-#endif // FILTER_ASSETS_BY_CLASS_PATH
-}
 
 static TArray<FProperty*> GetChangedPropertiesList(
 	UStruct* InStruct, const uint8* DataPtr, const uint8* DefaultDataPtr)
@@ -70,121 +50,111 @@ static TArray<FProperty*> GetChangedPropertiesList(
 static bool FindBlueprintNativeParents(
 	const UClass* BlueprintGeneratedClass, TFunctionRef<void(UClass*)> Callback)
 {
-	if (BlueprintGeneratedClass == nullptr)
-	{
-		return false;
-	}
-	bool anyNativeParent = false;
+	bool bAnyNativeParent = false;
 	for (UClass* Super = BlueprintGeneratedClass->GetSuperClass(); Super; Super = Super->GetSuperClass())
 	{
 		// Ignore the root `UObject` class and non-native parents.
 		if (Super->HasAnyClassFlags(CLASS_Native) && Super->GetFName() != NAME_Object)
 		{
-			anyNativeParent = true;
+			bAnyNativeParent = true;
 			Callback(Super);
 		}
 	}
 
-	return anyNativeParent;
+	return bAnyNativeParent;
 }
 
-struct PropertyEntry
+struct FPropertyEntry
 {
 	FProperty* Property;
 	TArray<int32> Blueprints;
 };
 
-struct FunctionEntry
+struct FFunctionEntry
 {
 	UFunction* Function;
 	TArray<int32> Blueprints;
 };
 
-struct ClassEntry
+struct FClassEntry
 {
 	const UClass* Class;
 	TArray<int32> Blueprints;
-	TMap<FString, PropertyEntry> Properties;
-	TMap<FString, FunctionEntry> Functions;
+	TMap<FString, FPropertyEntry> Properties;
+	TMap<FString, FFunctionEntry> Functions;
 };
 
-using ClassMap = TMap<FString, ClassEntry>;
+using ClassMap = TMap<FString, FClassEntry>;
 
-struct AssetIndex
+struct FAssetIndex
 {
 	TSet<FString> AssetPathCache;
 	ClassMap Classes;
 	TArray<const UClass*> Blueprints;
 
-	void ProcessBlueprint(const UBlueprintGeneratedClass* BPGC)
+	void ProcessBlueprint(const UBlueprintGeneratedClass* BlueprintGeneratedClass)
 	{
-		int32 BlueprintIndex = Blueprints.Num();
-
-		bool hasAnyParent = FindBlueprintNativeParents(BPGC, [&](UClass* Parent) {
-			FString ParentName = Parent->GetFName().ToString();
-		if (!Classes.Contains(ParentName))
-		{
-			Classes.Add(ParentName).Class = Parent;
-		}
-
-		ClassEntry& entry = Classes[ParentName];
-
-		entry.Blueprints.Add(BlueprintIndex);
-
-		UObject* GeneratedClassCDO = BPGC->ClassDefaultObject;
-		UObject* SuperClassCDO = Parent->GetDefaultObject(false);
-		TArray<FProperty*> ChangedProperties = GetChangedPropertiesList(Parent, (uint8*)GeneratedClassCDO, (uint8*)SuperClassCDO);
-
-		for (FProperty* Property : ChangedProperties)
-		{
-			FString PropertyName = Property->GetFName().ToString();
-			if (!entry.Properties.Contains(PropertyName))
-			{
-				entry.Properties.Add(PropertyName).Property = Property;
-			}
-
-			PropertyEntry& propEntry = entry.Properties[PropertyName];
-			propEntry.Blueprints.Add(BlueprintIndex);
-		}
-			});
-
-		if (BPGC == nullptr)
+		if (BlueprintGeneratedClass == nullptr)
 		{
 			return;
 		}
 
-		bool hasAnyFunctions = false;
-		for (UFunction* Fn : BPGC->CalledFunctions)
+		int32 BlueprintIndex = Blueprints.Num();
+
+		bool bHasAnyParent = FindBlueprintNativeParents(BlueprintGeneratedClass, [&](UClass* Parent)
 		{
-			if (!Fn->HasAnyFunctionFlags(EFunctionFlags::FUNC_Native))
+			FString ParentName = Parent->GetFName().ToString();
+			if (!Classes.Contains(ParentName))
 			{
-				continue;
+				Classes.Add(ParentName).Class = Parent;
 			}
 
-			hasAnyFunctions = true;
+			FClassEntry& ClassEntry = Classes[ParentName];
 
-			UClass* Owner = Fn->GetOwnerClass();
-			FString OwnerName = Owner->GetFName().ToString();
-			if (!Classes.Contains(OwnerName))
+			ClassEntry.Blueprints.Add(BlueprintIndex);
+
+			// Retrieve the properties from the parent class that changed in the Blueprint class, by comparing their CDOs.
+			UObject* GeneratedClassDefault = BlueprintGeneratedClass->ClassDefaultObject;
+			UObject* SuperClassDefault = Parent->GetDefaultObject(false);
+			TArray<FProperty*> ChangedProperties = GetChangedPropertiesList(Parent, (uint8*)GeneratedClassDefault, (uint8*)SuperClassDefault);
+
+			for (FProperty* Property : ChangedProperties)
 			{
-				Classes.Add(OwnerName).Class = Owner;
+				FString PropertyName = Property->GetFName().ToString();
+				if (!ClassEntry.Properties.Contains(PropertyName))
+				{
+					ClassEntry.Properties.Add(PropertyName).Property = Property;
+				}
+
+				FPropertyEntry& PropEntry = ClassEntry.Properties[PropertyName];
+				PropEntry.Blueprints.Add(BlueprintIndex);
 			}
 
-			ClassEntry& entry = Classes[OwnerName];
-
-			FString FnName = Fn->GetFName().ToString();
-			if (!entry.Functions.Contains(FnName))
+			// Iterate over the functions originally from the parent class
+			// and check if they are implemented in the BP class as well.
+			for (TFieldIterator<UFunction> It(Parent, EFieldIteratorFlags::ExcludeSuper); It; ++It)
 			{
-				entry.Functions.Add(FnName).Function = Fn;
+				UFunction* Fn = BlueprintGeneratedClass->FindFunctionByName((*It)->GetFName(), EIncludeSuperFlag::ExcludeSuper);
+				// If the function not present in the BP class directly, it means it was implemented. Otherwise, ignore.
+				if (!Fn)
+				{
+					continue;
+				}
+
+				FString FnName = Fn->GetFName().ToString();
+				if (!ClassEntry.Functions.Contains(FnName))
+				{
+					ClassEntry.Functions.Add(FnName).Function = Fn;
+				}
+
+				FFunctionEntry& FuncEntry = ClassEntry.Functions[FnName];
+				FuncEntry.Blueprints.Add(BlueprintIndex);
 			}
+		});
 
-			FunctionEntry& funcEntry = entry.Functions[FnName];
-			funcEntry.Blueprints.Add(BlueprintIndex);
-		}
-
-		if (hasAnyParent || hasAnyFunctions)
+		if (bHasAnyParent)
 		{
-			check(Blueprints.Add(BPGC) == BlueprintIndex);
+			check(Blueprints.Add(BlueprintGeneratedClass) == BlueprintIndex);
 		}
 
 		return;
@@ -195,6 +165,11 @@ using JsonWriter = TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>;
 
 static bool ShouldSerializePropertyValue(FProperty* Property)
 {
+	if (Property->ArrayDim > 1) // Skip properties that are not scalars
+	{
+		return false;
+	}
+
 	if (FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property))
 	{
 		return true;
@@ -246,7 +221,7 @@ static void SerializeBlueprints(TSharedRef<JsonWriter>& Json, TArray<const UClas
 	Json->WriteArrayEnd();
 }
 
-static void SerializeProperties(TSharedRef<JsonWriter>& Json, ClassEntry& Entry, TArray<const UClass*>& Blueprints)
+static void SerializeProperties(TSharedRef<JsonWriter>& Json, FClassEntry& Entry, TArray<const UClass*>& Blueprints)
 {
 	Json->WriteArrayStart();
 	for (auto& Item : Entry.Properties)
@@ -262,9 +237,9 @@ static void SerializeProperties(TSharedRef<JsonWriter>& Json, ClassEntry& Entry,
 		Json->WriteIdentifierPrefix(TEXT("metadata"));
 		{
 			Json->WriteObjectStart();
-			if (Property->HasMetaData(NAME_Category))
+			if (Property->HasMetaData(CategoryFName))
 			{
-				Json->WriteValue(TEXT("categories"), Property->GetMetaData(NAME_Category));
+				Json->WriteValue(TEXT("categories"), Property->GetMetaData(CategoryFName));
 			}
 			Json->WriteObjectEnd();
 		}
@@ -272,14 +247,14 @@ static void SerializeProperties(TSharedRef<JsonWriter>& Json, ClassEntry& Entry,
 		Json->WriteIdentifierPrefix(TEXT("values"));
 		{
 			Json->WriteArrayStart();
-			for (auto& BPEntry : PropEntry.Blueprints)
+			for (auto& BlueprintEntry : PropEntry.Blueprints)
 			{
 				Json->WriteObjectStart();
 
-				Json->WriteValue(TEXT("blueprint"), BPEntry);
+				Json->WriteValue(TEXT("blueprint"), BlueprintEntry);
 
-				UObject* GeneratedClassCDO = Blueprints[BPEntry]->ClassDefaultObject;
-				const uint8* PropData = PropEntry.Property->ContainerPtrToValuePtr<uint8>(GeneratedClassCDO);
+				UObject* GeneratedClassDefault = Blueprints[BlueprintEntry]->ClassDefaultObject;
+				const uint8* PropData = PropEntry.Property->ContainerPtrToValuePtr<uint8>(GeneratedClassDefault);
 
 				if (ShouldSerializePropertyValue(PropEntry.Property))
 				{
@@ -297,7 +272,7 @@ static void SerializeProperties(TSharedRef<JsonWriter>& Json, ClassEntry& Entry,
 	Json->WriteArrayEnd();
 }
 
-static void SerializeFunctions(TSharedRef<JsonWriter>& Json, ClassEntry& Entry)
+static void SerializeFunctions(TSharedRef<JsonWriter>& Json, FClassEntry& Entry)
 {
 	Json->WriteArrayStart();
 	for (auto& Item : Entry.Functions)
@@ -335,7 +310,7 @@ static void SerializeClasses(TSharedRef<JsonWriter>& Json, ClassMap& Items, TArr
 	Json->WriteArrayEnd();
 }
 
-static void SerializeToIndex(AssetIndex Index, FArchive& IndexFile)
+static void SerializeToIndex(FAssetIndex Index, FArchive& IndexFile)
 {
 	TSharedRef<JsonWriter> Json = JsonWriter::Create(&IndexFile);
 
@@ -389,55 +364,14 @@ static void GetNativeClassesByPath(const FString& InDir, TArray<TWeakObjectPtr<U
 	}
 }
 
-static void ProcessAssets(
-	AssetIndex& Index,
-	const TArray<FAssetData>& TargetAssets)
-{
-	// Show a simpler logging output.
-	// LogTimes are still useful to tell how long it takes to process each asset.
-	TGuardValue<bool> DisableLogVerbosity(GPrintLogVerbosity, false);
-	TGuardValue<bool> DisableLogCategory(GPrintLogCategory, false);
-
-	// We're about to load the assets which might trigger a ton of log messages
-	// Temporarily suppress them during this stage.
-	GEngine->Exec(nullptr, TEXT("log LogVisualStudioTools only"));
-	ON_SCOPE_EXIT
-	{
-		GEngine->Exec(nullptr, TEXT("log reset"));
-	};
-
-	FStreamableManager AssetLoader;
-
-	for (int32 i = 0; i < TargetAssets.Num(); i++)
-	{
-		FSoftClassPath GenClassPath = TargetAssets[i].GetTagValueRef<FString>(FBlueprintTags::GeneratedClassPath);
-
-		UE_LOG(LogVisualStudioTools, Display, TEXT("Processing blueprints [%d/%d]: %s"), i+1, TargetAssets.Num(), *GenClassPath.ToString());
-
-		TSharedPtr<FStreamableHandle> Handle = AssetLoader.RequestSyncLoad(GenClassPath);
-		ON_SCOPE_EXIT
-		{
-			// We're done, notify an unload.
-			Handle->ReleaseHandle();
-		};
-
-		if (!Handle.IsValid())
-		{
-			continue;
-		}
-
-		Index.ProcessBlueprint(Cast<UBlueprintGeneratedClass>(Handle->GetLoadedAsset()));
-	}
-}
-
 static void RunAssetScan(
-	AssetIndex& Index,
+	FAssetIndex& Index,
 	const TArray<TWeakObjectPtr<UClass>>& FilterBaseClasses)
 {
 	FARFilter Filter;
 	Filter.bRecursivePaths = true;
 	Filter.bRecursiveClasses = true;
-	SetBlueprintClassFilter(Filter);
+	AssetHelpers::SetBlueprintClassFilter(Filter);
 
 	// Add all base classes to the tag filter for native parent
 	Algo::Transform(FilterBaseClasses, Filter.TagsAndValues, [](const TWeakObjectPtr<UClass>& Class) {
@@ -451,27 +385,22 @@ static void RunAssetScan(
 	TArray<FAssetData> TargetAssets;
 	AssetRegistry.GetAssets(Filter, TargetAssets);
 
-	ProcessAssets(Index, TargetAssets);
+	AssetHelpers::ForEachAsset(TargetAssets,
+		[&](UBlueprintGeneratedClass* BlueprintGeneratedClass, const FAssetData& /*AssetData*/)
+		{
+			Index.ProcessBlueprint(BlueprintGeneratedClass);
+		});
 }
+
 } // namespace VS
 
-static constexpr auto HelpSwitch = TEXT("help");
 static constexpr auto FilterSwitch = TEXT("filter");
 static constexpr auto FullSwitch = TEXT("full");
-static constexpr auto OutputSwitch = TEXT("output");
 
 UVisualStudioToolsCommandlet::UVisualStudioToolsCommandlet()
+	: Super()
 {
-	IsClient = false;
-	IsEditor = true;
-	IsServer = false;
-	LogToConsole = false;
-	ShowErrorCount = false;
-
 	HelpDescription = TEXT("Commandlet for generating data used by Blueprint support in Visual Studio.");
-
-	HelpParamNames.Add(OutputSwitch);
-	HelpParamDescriptions.Add(TEXT("[Required] The file path to write the command output."));
 
 	HelpParamNames.Add(FilterSwitch);
 	HelpParamDescriptions.Add(TEXT("[Optional] Scan only blueprints derived from native classes under the provided path. Defaults to `FPaths::ProjectDir`. Incompatible with `-full`."));
@@ -479,71 +408,19 @@ UVisualStudioToolsCommandlet::UVisualStudioToolsCommandlet()
 	HelpParamNames.Add(FullSwitch);
 	HelpParamDescriptions.Add(TEXT("[Optional] Scan blueprints derived from native classes from ALL modules, include the Engine. This can be _very slow_ for large projects. Incompatible with `-filter`."));
 
-	HelpParamNames.Add(HelpSwitch);
-	HelpParamDescriptions.Add(TEXT("[Optional] Print this help message and quit the commandlet immediately."));
-
 	HelpUsage = TEXT("<Editor-Cmd.exe> <path_to_uproject> -run=VisualStudioTools -output=<path_to_output_file> [-filter=<subdir_native_classes>|-full] [-unattended -noshadercompile -nosound -nullrhi -nocpuprofilertrace -nocrashreports -nosplash]");
 }
 
-void UVisualStudioToolsCommandlet::PrintHelp() const
+int32 UVisualStudioToolsCommandlet::Run(
+	TArray<FString>& Tokens,
+	TArray<FString>& Switches,
+	TMap<FString, FString>& ParamVals,
+	FArchive& OutArchive)
 {
-	UE_LOG(LogVisualStudioTools, Display, TEXT("%s"), *HelpDescription);
-	UE_LOG(LogVisualStudioTools, Display, TEXT("Usage: %s"), *HelpUsage);
-	UE_LOG(LogVisualStudioTools, Display, TEXT("Parameters:"));
-	for (int32 i = 0; i < HelpParamNames.Num(); ++i)
-	{
-		UE_LOG(LogVisualStudioTools, Display, TEXT("\t-%s: %s"), *HelpParamNames[i], *HelpParamDescriptions[i]);
-	}
-}
-
-int32 UVisualStudioToolsCommandlet::Main(const FString& Params)
-{
-	TArray<FString> Tokens;
-	TArray<FString> Switches;
-	TMap<FString, FString> ParamVals;
-
-	ParseCommandLine(*Params, Tokens, Switches, ParamVals);
-
-	if (Switches.Contains(HelpSwitch))
-	{
-		PrintHelp();
-		return 0;
-	}
-
-	UE_LOG(LogVisualStudioTools, Display, TEXT("Init VS Tools cmdlet."));
-
-	if (!FPaths::IsProjectFilePathSet())
-	{
-		UE_LOG(LogVisualStudioTools, Error, TEXT("You must invoke this commandlet with a project file."));
-		return -1;
-	}
-
-	FString FullPath = ParamVals.FindRef(OutputSwitch);
-
-	if (FullPath.IsEmpty() && !FParse::Value(*Params, TEXT("output "), FullPath))
-	{
-		// VS:1678426 - Initial version was using `-output "path-to-file"` (POSIX style).
-		// However, that does not support paths with spaces, even when surrounded with
-		// quotes because `FParse::Value` only handles that case when there's no space
-		// between the parameter name and quoted value.
-		// For back-compatibility reasons, parse that style by including the space in
-		// the parameter token like it's usually done for the `=` sign.
-		UE_LOG(LogVisualStudioTools, Error, TEXT("Missing file output parameter."));
-		PrintHelp();
-		return -1;
-	}
-
-	TUniquePtr<FArchive> OutArchive{ IFileManager::Get().CreateFileWriter(*FullPath) };
-	if (!OutArchive)
-	{
-		UE_LOG(LogVisualStudioTools, Error, TEXT("Failed to create index with path: %s."), *FullPath);
-		return -1;
-	}
-
-	using namespace VSTools;
+	using namespace VisualStudioTools;
 
 	FString* Filter = ParamVals.Find(FilterSwitch);
-	bool bFullScan = Switches.Contains(FilterSwitch);
+	const bool bFullScan = Switches.Contains(FullSwitch);
 
 	if (Filter != nullptr && bFullScan)
 	{
@@ -565,13 +442,24 @@ int32 UVisualStudioToolsCommandlet::Main(const FString& Params)
 			GetNativeClassesByPath(FPaths::ProjectDir(), FilterBaseClasses);
 		}
 	}
-	
-	AssetIndex Index;
-	RunAssetScan(Index, FilterBaseClasses);
-	SerializeToIndex(Index, *OutArchive);
+	else
+	{
+		for (TObjectIterator<UClass> ClassIt; ClassIt; ++ClassIt)
+		{
+			UClass* TestClass = *ClassIt;
+			if (!TestClass->HasAnyClassFlags(CLASS_Native))
+			{
+				continue;
+			}
 
+			FilterBaseClasses.Add(TestClass);
+		}
+	}
+
+	FAssetIndex Index;
+	RunAssetScan(Index, FilterBaseClasses);
+	SerializeToIndex(Index, OutArchive);
 	UE_LOG(LogVisualStudioTools, Display, TEXT("Found %d blueprints."), Index.Blueprints.Num());
 
 	return 0;
 }
-

@@ -11,7 +11,7 @@
 #include "Engine/StreamableManager.h"
 #include "HAL/FileManager.h"
 #include "JsonObjectConverter.h"
-#include "Launch/Resources/Version.h"
+#include "Runtime/Launch/Resources/Version.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
 #include "Policies/CondensedJsonPrintPolicy.h"

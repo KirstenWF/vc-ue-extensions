@@ -39,6 +39,8 @@ extends:
       os: windows
     customBuildTags:
     - ES365AIMigrationTooling
+    settings:
+      networkIsolationPolicy: Permissive,CFSClean,CFSClean2,CFSClean3
     stages:
     - stage: stage
       jobs:
@@ -70,6 +72,15 @@ extends:
         - task: MSBuild@1
           displayName: 'Build Plugin'
           timeoutInMinutes: 300
+          env:
+            # Building the plugin compiles Unreal Engine's own C# tooling (UnrealBuildTool,
+            # AutomationTool, EpicGames.*), which restores NuGet packages. Those projects live in
+            # the cloned UE tree (a sibling of this repo), so NuGet's directory walk never finds the
+            # repo-root NuGet.config and falls back to api.nuget.org, which is blocked under network
+            # isolation (Permissive,CFSClean,CFSClean2,CFSClean3) -> NU1301. Setting RestoreConfigFile
+            # forces every restore in this step's process tree (msbuild -> build.proj -> RunUAT ->
+            # dotnet build) to use the repo's CFS-only NuGet.config instead.
+            RestoreConfigFile: '$(Build.SourcesDirectory)/NuGet.config'
           inputs:
             solution: '$(Build.SourcesDirectory)/build.proj'
             msbuildArguments: '/p:UnrealEngine=$(Agent.BuildDirectory)\ue /p:OutputPath=$(Build.ArtifactStagingDirectory)\drop /p:VulkanReadyBinaries=true'
@@ -93,13 +104,15 @@ extends:
         - task: APIScan@2
           displayName: 'Run APIScan'
           inputs:
+            azureSubscription: 'VSEng-APIScanSC'
             softwareFolder: '$(Build.ArtifactStagingDirectory)/binariesToAnalyze'
             softwareName: 'Visual Studio Tools for Unreal Engine'
             softwareVersionNum: '2.4'
             softwareBuildNum: '$(Build.BuildId)'
             toolVersion: 'Latest'
           env:
-            AzureServicesAuthConnectionString: runAs=App;AppId=$(ApiScanClientId)
+            AzureServicesAuthConnectionString: RunAs=App;AppId=d318cba7-db4d-4fb3-99e1-01879cb74e91;TenantId=72f988bf-86f1-41af-91ab-2d7cd011db47;ServiceConnectionId=93e24264-c5e6-4681-8175-ec8a41668480;
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
         - task: SDLNativeRules@3
           displayName: 'Run the PREfast SDL Native Rules for MSBuild'
           env:
